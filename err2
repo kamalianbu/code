@@ -1,0 +1,27 @@
+TypeError
+patch_obj() missing 3 required positional arguments: 'old_to_new', 'measure_names', and 'measures_table_name'
+---------------------------------------------------------------------------
+TypeError                                 Traceback (most recent call last)
+Cell In[247], line 62
+     59 # Apply the format-appropriate patch. Both functions mutate `parts` in place
+     60 # and return before/after counts so we can report how many references changed.
+     61 if has_visual_files:
+---> 62     before, after, patched = patch_pbir(parts, old_to_new, measure_names, measures_table_name)
+     63 else:
+     64     before, after, patched = patch_pbir_legacy(parts, old_to_new, measure_names, measures_table_name)
+
+Cell In[199], line 20, in patch_pbir(parts, old_to_new, measure_names, measures_table_name)
+     18 try:
+     19     obj = json.loads(decoded)
+---> 20     if patch_obj(obj, old_to_new, measure_names, measures_table_name):
+     21         patched_str = json.dumps(obj, indent=2, ensure_ascii=False)
+     22         after_count = sum(patched_str.count(t) for t in old_to_new.keys())
+
+Cell In[187], line 42, in patch_obj(obj, old_to_new, measure_names, measures_table_name)
+     40                     changed = True
+     41     for v in obj.values():
+---> 42         if patch_obj(v):
+     43             changed = True
+     44 elif isinstance(obj, list):
+
+TypeError: patch_obj() missing 3 required positional arguments: 'old_to_new', 'measure_names', and 'measures_table_name'
