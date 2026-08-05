@@ -1,0 +1,155 @@
+Discover current measures
+with labs.tom.connect_semantic_model(dataset=target_dataset, workspace=target_workspace, readonly=True) as tom:
+    rows = []
+    for m in tom.all_measures():
+        rows.append({
+            "Table": m.Parent.Name,
+            "Measure": m.Name,
+            "Expression": m.Expression,
+            "FormatString": m.FormatString,
+            "Description": m.Description,
+            "DisplayFolder": m.DisplayFolder,
+            "IsHidden": m.IsHidden
+        })
+
+df_measures = pd.DataFrame(rows)
+
+if measures_to_migrate is not None:
+    df_measures = df_measures[df_measures["Measure"].isin(measures_to_migrate)]
+
+# These globals are consumed by patch_query() and patch_obj() in model_analysis_utils.
+# They must be populated before future cell = Path All Reports runs.
+
+measure_names      = set(df_measures["Measure"].tolist())
+measure_old_tables = dict(zip(df_measures["Measure"], df_measures["Table"]))
+old_tables         = set(df_measures["Table"].tolist())
+
+
+old_to_new         = {t: measures_table_name for t in old_tables if t != measures_table_name}
+
+if not old_to_new:
+    print("\nAll measures are already in the target table.")
+    print("'Patch All Reports' and 'Move Measures' cells can be skipped.")
+    
+Dax audit
+
+df_to_move = df_measures[df_measures["Table"] != measures_table_name]
+
+print(f"Total measures: {len(df_measures)}")
+print(f"Already in '{measures_table_name}': {len(df_measures) - len(df_to_move)}")
+print(f"To move: {len(df_to_move)}")
+print(f"Old tables to remap: {list(old_to_new.keys())}")
+print(f"\nMeasures by table:")
+print(df_measures.groupby("Table").size())
+display(df_to_move[["Table", "Measure", "Expression"]])
+
+pattern = re.compile(r"'([^']+)'\[([^\]]+)\]")
+issues = []
+measures_in_scope = set(df_to_move["Measure"].values)
+
+for _, row in df_to_move.iterrows():
+    if row["Expression"]:
+        for match in pattern.finditer(row["Expression"]):
+            ref_table, ref_measure = match.group(1), match.group(2)
+            if ref_measure in measures_in_scope:
+                issues.append({
+                    "Measure": row["Measure"],
+                    "References": match.group(0),
+                    "ReferencedMeasure": ref_measure
+                })
+
+if issues:
+    print(f"Found {len(issues)} qualified reference(s). The 'Move Measures' step will auto-fix these.\n")
+    display(pd.DataFrame(issues))
+else:
+    print("No qualified measure-to-measure references found. DAX is already clean.")
+
+Patch all report defintions
+
+# Verify the discover step has populated the globals this cell depends on
+if "measure_names" not in dir() or "old_to_new" not in dir():
+    raise RuntimeError("Run the 'Discover current measures' cell before patching.")
+
+workspace_id = fabric.resolve_workspace_id(target_workspace)
+client = fabric.FabricRestClient()
+
+
+# ── Patch all cloned reports ────────────────────────────────────────────────
+# This is the driver loop that orchestrates the full patch sequence for every
+# report in the active profile. For each report it: downloads the definition,
+# detects the format (PBIR vs PBIR-Legacy), remaps measure references from
+# old source tables to _Measures, and uploads the patched definition back.
+# Reports that reference no measures are skipped entirely.
+
+time.sleep(5)  # Allow clones to settle in the Fabric backend before querying, if we didn't have this then the clones may not be accessible / visible to the API
+
+# Retrieve ALL reports in the workspace once, then filter to the ones this
+# profile cares about. This avoids repeated API calls inside the loop.
+all_reports = fabric.list_reports(workspace=target_workspace)
+summary = []
+
+for rpt_name in source_reports:
+    target_rpt_name = f"{rpt_name}{report_suffix}"
+    print(f"\n{'='*60}")
+    print(f"{target_rpt_name}")
+    print(f"{'='*60}")
+
+    # Look up the cloned report by its expected name in the workspace listing
+    report_row = all_reports[all_reports["Name"] == target_rpt_name]
+    if report_row.empty:
+        print(f"  Not found. Skipping.")
+        summary.append({"Report": rpt_name, "Status": "Not found", "Measures Used": 0, "Refs Patched": 0})
+        continue
+
+    # Download the full report definition (async poll handled by get_report_definition)
+    report_id = report_row["Id"].values[0]
+    result = get_report_definition(report_id)
+    parts = result["definition"]["parts"]
+
+    # Quick text scan to see which measures this report actually references.
+    # If none, there is nothing to remap and we skip the expensive patch step.
+    measures_found = scan_measure_usage(parts)
+
+    # Format detection: PBIR reports contain individual visual.json files per
+    # visual; PBIR-Legacy stores everything in a single report.json. The two
+    # formats require different patching strategies (patch_pbir vs patch_pbir_legacy).
+    has_visual_files = any("visual.json" in p["path"] for p in parts)
+    fmt = "PBIR" if has_visual_files else "PBIR-Legacy"
+
+    print(f"  Format: {fmt}")
+    print(f"  Measures referenced: {len(measures_found)}")
+
+    if len(measures_found) == 0:
+        print(f"  No measures used. Skipping patch.")
+        summary.append({"Report": rpt_name, "Status": "No measures used", "Measures Used": 0, "Refs Patched": 0})
+        continue
+
+    # Apply the format-appropriate patch. Both functions mutate `parts` in place
+    # and return before/after counts so we can report how many references changed.
+    if has_visual_files:
+        before, after, patched = patch_pbir(parts)
+    else:
+        before, after, patched = patch_pbir_legacy(parts)
+
+    refs_patched = before - after
+    print(f"  Patched: {before} -> {after} ({refs_patched} refs, {patched} files)")
+
+    # Push the patched definition back to Fabric. The report will be temporarily
+    # broken between this upload and the measure-move step completing, because
+    # the definition now points to _Measures but the model has not moved them yet.
+    if upload_report_definition(report_id, result["definition"]):
+        print(f"  Upload: Succeeded")
+        summary.append({"Report": rpt_name, "Status": "Patched", "Measures Used": len(measures_found), "Refs Patched": refs_patched})
+    else:
+        print(f"  Upload: Failed")
+        summary.append({"Report": rpt_name, "Status": "Upload failed", "Measures Used": len(measures_found), "Refs Patched": 0})
+
+print(f"\n\n{'='*60}")
+print("REPORT PATCH SUMMARY")
+print(f"{'='*60}\n")
+df_summary = pd.DataFrame(summary)
+display(df_summary)
+# Reports are now pointing at _Measures which does not yet exist in the model.
+# They will resolve correctly once the move-measures cell completes.
+print(f"\nAll reports patched. Reports are temporarily broken until the 'Move Measures' step completes.")
+
