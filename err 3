@@ -1,0 +1,32 @@
+---------------------------------------------------------------------------
+KeyError                                  Traceback (most recent call last)
+Cell In[580], line 64
+     62     before, after, patched = patch_pbir(parts, old_to_new, measure_names, measures_table_name)
+     63 else:
+---> 64     before, after, patched = patch_pbir_legacy(parts, old_to_new, measure_names, measures_table_name)
+     66 refs_patched = before - after
+     67 print(f"  Patched: {before} -> {after} ({refs_patched} refs, {patched} files)")
+
+Cell In[556], line 18, in patch_pbir_legacy(parts, old_to_new, measure_names, measures_table_name)
+     16 if "config" in vc and isinstance(vc["config"], str):
+     17     config = json.loads(vc["config"])
+---> 18     if patch_obj(config, old_to_new, measure_names, measures_table_name):
+     19         vc["config"] = json.dumps(config, separators=(",", ":"))
+     20         files_patched += 1
+
+Cell In[541], line 42, in patch_obj(obj, old_to_new, measure_names, measures_table_name)
+     40                     changed = True
+     41     for v in obj.values():
+---> 42         if patch_obj(v, old_to_new, measure_names, measures_table_name):
+     43             changed = True
+     44 elif isinstance(obj, list):
+
+Cell In[541], line 9, in patch_obj(obj, old_to_new, measure_names, measures_table_name)
+      6 if isinstance(obj, dict):
+      7     # Handle prototypeQuery blocks (PBIR-Legacy)
+      8     if "prototypeQuery" in obj:
+----> 9         if patch_query(obj["prototypeQuery"],old_to_new["prototypeQuery"],measure_names["prototypeQuery"],measures_table_name["prototypeQuery"]):
+     10             changed = True
+     11     # Handle ANY query block with From + Version (catches filters, subqueries, etc.)
+
+KeyError: 'prototypeQuery'
