@@ -1,0 +1,326 @@
+"""
+Power BI / Fabric report measure-migration patcher.
+
+Rewrites measure references — in visual queries AND in filters (visual,
+page/section, and report level) — so they point at the new central
+measures table instead of their old source table(s).
+
+WHY YOUR ORIGINAL CODE WORKED ON ONE REPORT BUT NOT MANY
+----------------------------------------------------------------------
+1. old_to_new / measure_names / measures_table_name were read as
+   GLOBALS inside patch_query(), not passed in as arguments. If your
+   outer loop computed those mappings once (e.g. from the first
+   report's bound semantic model) instead of fresh per report, every
+   report after the first one silently patched against the WRONG
+   mapping -> visuals broke.
+2. The Where-clause "fix" only did a substring search over
+   json.dumps(where_clause) to decide WHETHER something needed
+   patching, but never actually rewrote anything inside the Where
+   clause itself. That happens to be harmless when the alias is only
+   ever renamed in the From list (Where inherits the fix for free) —
+   but it fails the moment a Where clause needs its OWN SourceRef
+   rewritten (e.g. when a new alias was split off because the same
+   alias was shared by a Column and a Measure).
+3. Filters set at the visual/page/report "filter pane" level live in a
+   completely separate `filters` JSON blob, NOT inside query.Where at
+   all, and reference tables directly via SourceRef.Entity rather than
+   via a query's From-list alias. The old code never touched this at
+   all — this is very likely why some reports broke and others didn't:
+   it depends on whether that particular report had filter-pane
+   filters on the migrated measures.
+
+This version fixes all three. It assumes the classic Power BI report
+layout JSON (report.json inside a PBIX / "legacy" format: sections ->
+visualContainers -> config.singleVisual.prototypeQuery, plus `filters`
+on report/section/visualContainer). If you're on the newer PBIR
+project format (one JSON file per visual, filters under
+`filterConfig`), patch_query() and patch_filters() below are reusable
+as-is — only patch_report_layout()'s file-walking needs to change to
+open each visual.json file instead of walking sections/visualContainers.
+Tell me which format you're on and I'll adapt the walker.
+"""
+
+import json
+
+
+# ---------------------------------------------------------------------
+# 1. Query-level patcher (visual query From / Select / OrderBy / Where)
+# ---------------------------------------------------------------------
+
+def _rewrite_source_ref(node, alias_rewrite_map):
+    """Recursively walk any dict/list and rewrite SourceRef.Source
+    values found in alias_rewrite_map. Used to fix up Where clauses
+    after we split a shared alias into a new From entry."""
+    if isinstance(node, dict):
+        source_ref = node.get("SourceRef")
+        if isinstance(source_ref, dict) and source_ref.get("Source") in alias_rewrite_map:
+            source_ref["Source"] = alias_rewrite_map[source_ref["Source"]]
+        for v in node.values():
+            _rewrite_source_ref(v, alias_rewrite_map)
+    elif isinstance(node, list):
+        for item in node:
+            _rewrite_source_ref(item, alias_rewrite_map)
+
+
+def patch_query(query, old_to_new, measure_names, measures_table_name):
+    """
+    Rewrites a single visual query block (From / Select / OrderBy / Where)
+    so that measure references point at `measures_table_name` instead of
+    their old source table(s).
+
+    old_to_new:  {old_entity_name: new_entity_name} - only the KEYS are
+                 used to detect "this From entry needs migrating"; the
+                 destination is always measures_table_name.
+    measure_names: set/list of measure names being migrated.
+    measures_table_name: name of the central measures table.
+
+    Returns True if anything changed. Mutates `query` in place.
+    """
+    if "From" not in query:
+        return False
+
+    from_list = query["From"]
+    select_list = query.get("Select", [])
+    order_list = query.get("OrderBy", [])
+    where_list = query.get("Where", [])
+
+    old_alias_map = {
+        f["Name"]: f["Entity"]
+        for f in from_list
+        if f.get("Entity") in old_to_new
+    }
+    if not old_alias_map:
+        return False
+
+    measure_aliases = set()
+    column_aliases = set()
+
+    def _scan_expr(expr_holder):
+        if "Measure" in expr_holder:
+            m = expr_holder["Measure"]
+            prop = m.get("Property", "")
+            alias = m.get("Expression", {}).get("SourceRef", {}).get("Source")
+            if prop in measure_names and alias in old_alias_map:
+                measure_aliases.add(alias)
+        if "Column" in expr_holder:
+            c = expr_holder["Column"]
+            alias = c.get("Expression", {}).get("SourceRef", {}).get("Source")
+            if alias in old_alias_map:
+                column_aliases.add(alias)
+
+    for sel in select_list:
+        _scan_expr(sel)
+
+    for ob in order_list:
+        _scan_expr(ob.get("Expression", {}))
+
+    # Find every Measure node in Where, no matter how deeply nested
+    # (And / Or / Not / Comparison / In / Contains / ...), instead of a
+    # flat substring search over the dumped JSON.
+    def _scan_where(node):
+        if isinstance(node, dict):
+            if "Measure" in node and isinstance(node["Measure"], dict):
+                m = node["Measure"]
+                prop = m.get("Property", "")
+                alias = m.get("Expression", {}).get("SourceRef", {}).get("Source")
+                if prop in measure_names and alias in old_alias_map:
+                    measure_aliases.add(alias)
+            for v in node.values():
+                _scan_where(v)
+        elif isinstance(node, list):
+            for item in node:
+                _scan_where(item)
+
+    for where_clause in where_list:
+        _scan_where(where_clause)
+
+    if not measure_aliases:
+        return False
+
+    changed = False
+    alias_rewrite_map = {}  # old alias -> new alias (only for split-off aliases)
+
+    for alias in measure_aliases:
+        if alias in column_aliases:
+            # Alias is shared by a Column select AND a Measure select ->
+            # can't just repoint the From entry (would break the Column).
+            # Add a NEW From entry for the measures table and repoint
+            # only the measure references at it.
+            used = {f["Name"] for f in from_list}
+            new_alias = "m"
+            while new_alias in used:
+                new_alias = chr(ord(new_alias) + 1)
+            from_list.append({
+                "Name": new_alias,
+                "Entity": measures_table_name,
+                "Type": 0
+            })
+            for sel in select_list:
+                if "Measure" in sel:
+                    m = sel["Measure"]
+                    src = m.get("Expression", {}).get("SourceRef", {}).get("Source")
+                    if m.get("Property", "") in measure_names and src == alias:
+                        m["Expression"]["SourceRef"]["Source"] = new_alias
+            for ob in order_list:
+                expr = ob.get("Expression", {})
+                if "Measure" in expr:
+                    src = expr["Measure"].get("Expression", {}).get("SourceRef", {}).get("Source")
+                    if src == alias:
+                        expr["Measure"]["Expression"]["SourceRef"]["Source"] = new_alias
+            alias_rewrite_map[alias] = new_alias
+            changed = True
+        else:
+            # Alias is only ever used for measures in this query -> safe
+            # to repoint the existing From entry in place. Where clauses
+            # using this same alias inherit the fix automatically since
+            # they still resolve through the same (now-repointed) alias.
+            for f in from_list:
+                if f["Name"] == alias:
+                    f["Entity"] = measures_table_name
+            changed = True
+
+    # Actually rewrite Where's SourceRef.Source for any alias we split
+    # off above (this step was MISSING before).
+    if alias_rewrite_map:
+        for where_clause in where_list:
+            _rewrite_source_ref(where_clause, alias_rewrite_map)
+
+    return changed
+
+
+# ---------------------------------------------------------------------
+# 2. Filters-collection patcher (visual / page / report level filters)
+# ---------------------------------------------------------------------
+
+def patch_filters(filters, old_to_new, measure_names, measures_table_name):
+    """
+    Rewrites a `filters` array (visual-level, page/section-level, or
+    report-level filter-pane filters). Unlike query.Where, these
+    reference their table directly via SourceRef.Entity - there's no
+    From/alias list involved, which is why the old query-only patch
+    missed these entirely.
+
+    filters: parsed filters (list/dict, already json.loads'd by caller
+             or passed as-is if already a Python object).
+    Returns True if anything changed. Mutates `filters` in place.
+    """
+    if not filters:
+        return False
+
+    changed_flag = {"changed": False}
+
+    def _walk(node):
+        if isinstance(node, dict):
+            if "Measure" in node and isinstance(node["Measure"], dict):
+                m = node["Measure"]
+                prop = m.get("Property", "")
+                src_ref = m.get("Expression", {}).get("SourceRef", {})
+                entity = src_ref.get("Entity")
+                if entity in old_to_new and prop in measure_names:
+                    src_ref["Entity"] = measures_table_name
+                    changed_flag["changed"] = True
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(filters)
+    return changed_flag["changed"]
+
+
+# ---------------------------------------------------------------------
+# 3. Whole-report walker - applies both patchers everywhere they occur,
+#    for ONE report, with mappings passed in explicitly (no globals).
+# ---------------------------------------------------------------------
+
+def patch_report_layout(layout, old_to_new, measure_names, measures_table_name):
+    """
+    layout: parsed report `layout` JSON (dict) for ONE report, i.e.
+            json.loads(layout_string).
+    Returns (changed: bool, stats: dict).
+    """
+    stats = {"queries_patched": 0, "filters_patched": 0}
+    changed_any = False
+
+    # report-level filters
+    report_filters_raw = layout.get("filters")
+    if report_filters_raw:
+        is_str = isinstance(report_filters_raw, str)
+        report_filters = json.loads(report_filters_raw) if is_str else report_filters_raw
+        if patch_filters(report_filters, old_to_new, measure_names, measures_table_name):
+            layout["filters"] = json.dumps(report_filters) if is_str else report_filters
+            stats["filters_patched"] += 1
+            changed_any = True
+
+    for section in layout.get("sections", []):
+        # page/section-level filters
+        section_filters_raw = section.get("filters")
+        if section_filters_raw:
+            is_str = isinstance(section_filters_raw, str)
+            section_filters = json.loads(section_filters_raw) if is_str else section_filters_raw
+            if patch_filters(section_filters, old_to_new, measure_names, measures_table_name):
+                section["filters"] = json.dumps(section_filters) if is_str else section_filters
+                stats["filters_patched"] += 1
+                changed_any = True
+
+        for vc in section.get("visualContainers", []):
+            config_raw = vc.get("config")
+            if not config_raw:
+                continue
+            is_cfg_str = isinstance(config_raw, str)
+            config = json.loads(config_raw) if is_cfg_str else config_raw
+            vc_changed = False
+
+            # visual-level filters
+            vfilters_raw = vc.get("filters")
+            if vfilters_raw:
+                is_str = isinstance(vfilters_raw, str)
+                vfilters = json.loads(vfilters_raw) if is_str else vfilters_raw
+                if patch_filters(vfilters, old_to_new, measure_names, measures_table_name):
+                    vc["filters"] = json.dumps(vfilters) if is_str else vfilters
+                    stats["filters_patched"] += 1
+                    vc_changed = True
+
+            # the visual's own query
+            single_visual = config.get("singleVisual", {})
+            query = single_visual.get("prototypeQuery")
+            if query and patch_query(query, old_to_new, measure_names, measures_table_name):
+                stats["queries_patched"] += 1
+                vc_changed = True
+
+            if vc_changed:
+                vc["config"] = json.dumps(config) if is_cfg_str else config
+                changed_any = True
+
+    return changed_any, stats
+
+
+# ---------------------------------------------------------------------
+# 4. Driving loop across MULTIPLE reports - mapping is recomputed fresh
+#    for every report, so nothing leaks from one report to the next.
+# ---------------------------------------------------------------------
+
+def migrate_reports(reports, mapping_resolver, measures_table_name):
+    """
+    reports: iterable of {"report_id": ..., "layout": <parsed layout JSON>}
+    mapping_resolver: function(report) -> (old_to_new: dict, measure_names: set)
+                       Resolve THIS report's own old->new table map and
+                       measure list against whichever semantic model it
+                       is actually bound to. This is the piece that was
+                       most likely NOT being recomputed per report before.
+    measures_table_name: central measures table name (make this a
+                       per-report lookup too if it varies by model).
+
+    Returns a list of per-report result dicts for logging/verification.
+    """
+    results = []
+    for report in reports:
+        # Recomputed fresh for THIS report, every iteration.
+        old_to_new, measure_names = mapping_resolver(report)
+
+        changed, stats = patch_report_layout(
+            report["layout"], old_to_new, measure_names, measures_table_name
+        )
+        results.append({"report_id": report.get("report_id"), "changed": changed, **stats})
+    return results
