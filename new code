@@ -1,0 +1,51 @@
+# --- Add to utils notebook ---
+
+def find_old_measure_entities(obj, old_to_new):
+    """Recursively scan any parsed JSON object for Measure nodes still
+    pointing at an old table. Returns list of (measure_name, old_entity)."""
+    found = []
+    if isinstance(obj, dict):
+        if "Measure" in obj and isinstance(obj["Measure"], dict):
+            try:
+                entity = obj["Measure"]["Expression"]["SourceRef"].get("Entity")
+                if entity in old_to_new:
+                    found.append((obj["Measure"].get("Property"), entity))
+            except Exception:
+                pass
+        for v in obj.values():
+            found.extend(find_old_measure_entities(v, old_to_new))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(find_old_measure_entities(item, old_to_new))
+    return found
+
+
+def validate_parts(parts, old_to_new):
+    """Scan every JSON-parseable part of a report definition for leftover
+    old-table Measure references, after patching. Returns a list of dicts:
+    {"path": ..., "measure": ..., "old_entity": ...} - empty means clean."""
+    remaining = []
+    for part in parts:
+        try:
+            decoded = base64.b64decode(part["payload"]).decode("utf-8")
+            obj = json.loads(decoded)
+        except Exception:
+            continue
+        hits = find_old_measure_entities(obj, old_to_new)
+        for name, entity in hits:
+            remaining.append({"path": part["path"], "measure": name, "old_entity": entity})
+    return remaining
+
+
+# --- Add to the main notebook's "Patch all cloned reports" loop, right
+# after the refs_patched / print(f"  Patched: ...") lines and BEFORE
+# the upload_report_definition call, so you catch problems before
+# pushing a still-broken definition back to Fabric ---
+
+remaining_refs = validate_parts(parts, old_to_new)
+if remaining_refs:
+    print(f"  WARNING: {len(remaining_refs)} old measure reference(s) still remain after patching:")
+    for r in remaining_refs:
+        print(f"    {r['path']}: measure '{r['measure']}' still on '{r['old_entity']}'")
+else:
+    print(f"  Validation: clean, no old measure references remain")
