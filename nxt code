@@ -1,0 +1,92 @@
+
+
+with labs.tom.connect_semantic_model(dataset=target_dataset, workspace=target_workspace, readonly=False) as tom:
+    # All changes within this session commit atomically on exit.
+    # If any step fails, the session raises and nothing is saved.
+
+    # 1: Collect metadata
+    move_list = []
+    for m in tom.all_measures():
+        if m.Parent.Name == measures_table_name:
+            continue
+        if measures_to_migrate is not None and m.Name not in measures_to_migrate:
+            continue
+
+        source_table = m.Parent.Name
+        if source_table.startswith(display_folder_prefix):
+            folder = source_table[len(display_folder_prefix):]
+        else:
+            folder = ""
+
+        move_list.append({
+            "name": m.Name,
+            "expression": m.Expression,
+            "format_string": m.FormatString,
+            "description": m.Description,
+            "display_folder": folder,
+            "is_hidden": m.IsHidden,
+            "source_table": source_table
+        })
+
+    if not move_list:
+        print("No measures to move.")
+    else:
+        print(f"Moving {len(move_list)} measures\n")
+
+            # 2: # Rewrite qualified references to unqualified (O(n²) over move_list;
+                # acceptable for typical model sizes up to a few hundred measures)
+
+        rewrites_total = 0
+        for info in move_list:
+            if not info['expression']:
+                continue
+            for other in move_list:
+                qualified_ref = f"'{other['source_table']}'[{other['name']}]"
+                unqualified_ref = f"[{other['name']}]"
+                if qualified_ref in info['expression']:
+                    info['expression'] = info['expression'].replace(qualified_ref, unqualified_ref)
+                    rewrites_total += 1
+                    print(f"  DAX fix: {info['name']} -> {qualified_ref} to {unqualified_ref}")
+        if rewrites_total > 0:
+            print(f"\n  Rewrote {rewrites_total} qualified reference(s)\n")
+        else:
+            print(f"  DAX already clean\n")
+
+        # 3: Create measures table ONLY if it doesn't already exist
+        existing_table_names = {t.Name for t in tom.model.Tables}
+        if measures_table_name not in existing_table_names:
+            tom.add_calculated_table(name=measures_table_name, expression='{BLANK()}', hidden=True)
+            print(f"Created: {measures_table_name}")
+        else:
+            print(f"Using existing table: {measures_table_name}")
+
+
+        # # 3: Create measures table
+        # tom.add_calculated_table(
+        #     name=measures_table_name,
+        #     expression='{BLANK()}',
+        #     hidden=True
+        # )
+        #print(f"Created: {measures_table_name}")
+
+        # 4: Remove originals
+        for info in move_list:
+            table = tom.model.Tables[info["source_table"]]
+            table.Measures.Remove(table.Measures[info["name"]])
+        print(f"Removed {len(move_list)} measures from source tables")
+        
+
+        # 5: Add to _Measures with display folders
+        for info in move_list:
+            tom.add_measure(
+                table_name=measures_table_name,
+                measure_name=info["name"],
+                expression=info["expression"],
+                format_string=info["format_string"],
+                description=info["description"],
+                display_folder=info["display_folder"],
+                hidden=info["is_hidden"]
+            )
+        print(f"Added {len(move_list)} measures to '{measures_table_name}'")
+
+print("\nModel update complete. Open reports and verify.")
