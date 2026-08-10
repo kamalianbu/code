@@ -1,0 +1,17 @@
+# Validate measures_table_name exactly matches an existing table in the model (case-sensitive)
+with labs.tom.connect_semantic_model(dataset=target_dataset, workspace=target_workspace, readonly=True) as tom:
+    actual_table_names = [t.Name for t in tom.model.Tables]
+    
+    if measures_table_name not in actual_table_names:
+        # Check if it exists under a different case
+        case_match = [t for t in actual_table_names if t.lower() == measures_table_name.lower()]
+        if case_match:
+            print(f"  WARNING: measures_table_name='{measures_table_name}' has a case mismatch.")
+            print(f"  Auto-correcting to '{case_match[0]}' to match the model exactly.")
+            measures_table_name = case_match[0]   # ← fix it in place, rest of notebook uses corrected value
+        else:
+            print(f"  '{measures_table_name}' not found in model — will be created fresh.")
+    else:
+        print(f"  '{measures_table_name}' found in model — measures will be moved here.")
+
+print(f"\n  measures_table_name confirmed as: '{measures_table_name}'")
