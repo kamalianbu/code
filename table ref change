@@ -1,0 +1,109 @@
+def detect_table_renames(parts, tom):
+    """
+    Auto-detects table renames by comparing what the report references
+    against what actually exists in the current semantic model.
+    
+    For each table name the report references that doesn't exist in the
+    model, checks if the columns/measures it uses under that old name
+    now live under a different table. If yes, maps old -> new.
+    
+    Returns: dict {old_table_name: new_table_name}
+    """
+    # 1: Collect all (entity, field_name) pairs the report references
+    report_refs = {}  # {entity_name: set of field names used}
+
+ def _scan(node):
+    if isinstance(node, dict):
+        # Check Measure / Column / Hierarchy nodes directly
+        for key in ("Measure", "Column", "Hierarchy"):
+            if key in node and isinstance(node[key], dict):
+                field = node[key]
+                prop = field.get("Property")
+                entity = (
+                    field.get("Expression", {})
+                    .get("SourceRef", {})
+                    .get("Entity")
+                )
+                if entity and prop:
+                    report_refs.setdefault(entity, set()).add(prop)
+
+        # Also catch bare SourceRef (filters, drillthrough, etc.)
+        src_ref = node.get("SourceRef")
+        if isinstance(src_ref, dict):
+            entity = src_ref.get("Entity")
+            if entity:
+                report_refs.setdefault(entity, set())
+
+        # Check queryRef strings like "old_table.measure_name"
+        qr = node.get("queryRef")
+        if isinstance(qr, str) and "." in qr:
+            parts_split = qr.split(".", 1)
+            entity, prop = parts_split[0], parts_split[1]
+            report_refs.setdefault(entity, set()).add(prop)
+
+        for v in node.values():
+            _scan(v)
+    elif isinstance(node, list):
+        for item in node:
+            _scan(item)
+
+    for part in parts:
+        try:
+            decoded = base64.b64decode(part["payload"]).decode("utf-8")
+            obj = json.loads(decoded)
+            _scan(obj)
+        except Exception:
+            continue
+
+    # 2: Get what actually exists in the model
+    model_tables = {t.Name for t in tom.model.Tables}
+    model_columns = {}   # {table_name: set of column names}
+    model_measures = {}  # {table_name: set of measure names}
+    for t in tom.model.Tables:
+        model_columns[t.Name] = {c.Name for c in t.Columns}
+        model_measures[t.Name] = {m.Name for m in t.Measures}
+
+    # 3: For each entity the report uses that doesn't exist in model,
+    #    find which real table now contains those field names
+    rename_map = {}
+    for entity, fields in report_refs.items():
+        if entity in model_tables:
+            continue  # table still exists, no rename needed
+        if not fields:
+            continue  # no specific fields to match against
+
+        # Find which real table has the most matching field names
+        best_match = None
+        best_score = 0
+        for table_name in model_tables:
+            all_fields = model_columns.get(table_name, set()) | model_measures.get(table_name, set())
+            score = len(fields & all_fields)
+            if score > best_score:
+                best_score = score
+                best_match = table_name
+
+        if best_match and best_score > 0:
+            rename_map[entity] = best_match
+            print(f"  Auto-detected rename: '{entity}' -> '{best_match}' ({best_score} matching fields)")
+        else:
+            print(f"  WARNING: '{entity}' not in model and no matching table found — fields: {fields}")
+
+    return rename_map
+
+# Inside the patch loop, after format detection and before patch_pbir/patch_pbir_legacy
+# Auto-detect table renames for THIS specific report against THIS specific model
+with labs.tom.connect_semantic_model(dataset=target_dataset, workspace=target_workspace, readonly=True) as tom:
+    table_renames = detect_table_renames(parts, tom)
+
+if table_renames:
+    print(f"  Table renames detected: {table_renames}")
+    renamed_files = patch_table_renames(parts, table_renames)
+    print(f"  Table renames applied: {renamed_files} files")
+else:
+    print(f"  No table renames needed")
+
+# Then continue with existing patch_pbir / patch_pbir_legacy call as normal
+if has_visual_files:
+    before, after, patched = patch_pbir(parts, old_to_new, measure_names, measures_table_name)
+else:
+    before, after, patched = patch_pbir_legacy(parts, old_to_new, measure_names, measures_table_name)
