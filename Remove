@@ -1,0 +1,82 @@
+
+def get_legacy_report_measures(target_rpt_name, workspace):
+    """
+    Reads report-level (embedded) measures from a PBIR-Legacy report.json.
+    Always returns a DataFrame — empty if none found or the file can't be read.
+    """
+    print(f"\nreading legacy definition for: {target_rpt_name}")
+    rows = []
+
+    def find_measure_entities(obj):
+        found = []
+        if isinstance(obj, dict):
+            entities = obj.get("entities")
+            if isinstance(entities, list):
+                for entity in entities:
+                    if isinstance(entity, dict) and isinstance(entity.get("measures"), list):
+                        found.append(entity)
+            for value in obj.values():
+                found.extend(find_measure_entities(value))
+        elif isinstance(obj, list):
+            for item in obj:
+                found.extend(find_measure_entities(item))
+        return found
+
+    try:
+        with connect_report(report=target_rpt_name, workspace=workspace) as legacy_rpt:
+            report_json = None
+            for candidate_path in ("report.json", "definition/report.json"):
+                try:
+                    report_json = legacy_rpt.get(candidate_path, verbose=False)
+                except Exception:
+                    report_json = None
+                if report_json is not None:
+                    break
+
+            if report_json is None:
+                print(f"{target_rpt_name}: Could not read PBIR-Legacy report.json.")
+                return pd.DataFrame()
+
+            if isinstance(report_json, str):
+                try:
+                    report_json = json.loads(report_json)
+                except Exception as e:
+                    print(f"{target_rpt_name}: Could not parse report.json: {e}")
+                    return pd.DataFrame()
+
+            if not isinstance(report_json, dict):
+                print(f"{target_rpt_name}: Unexpected report.json type: {type(report_json)}")
+                return pd.DataFrame()
+
+            entities = find_measure_entities(report_json)
+
+            # De-dupe (nested search can revisit the same node)
+            unique_entities, seen = [], set()
+            for entity in entities:
+                key = (entity.get("name"), str(entity.get("measures")))
+                if key not in seen:
+                    seen.add(key)
+                    unique_entities.append(entity)
+            entities = unique_entities
+
+            print(f"{target_rpt_name}: legacy measure entities found = {len(entities)}")
+
+            for entity in entities:
+                table_name = entity.get("name")
+                for measure in entity.get("measures", []):
+                    if not isinstance(measure, dict):
+                        continue
+                    rows.append({
+                        "Measure_Name": measure.get("name"),
+                        "Table_Name": table_name,
+                        "Expression": measure.get("expression"),
+                        "Data_type": measure.get("dataType"),
+                        "Format_String": measure.get("formatString"),
+                    })
+
+            print(f"{target_rpt_name}: {len(rows)} legacy report-level measure(s) found.")
+            return pd.DataFrame(rows)
+
+    except Exception as e:
+        print(f"{target_rpt_name}: PBIR-Legacy read error - {str(e)[:300]}")
+        return pd.DataFrame()
