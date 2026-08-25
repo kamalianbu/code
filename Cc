@@ -1,0 +1,58 @@
+def inspect_legacy_visual_queries(target_rpt_name, workspace):
+
+    print(f"\nInspecting visual/query content: {target_rpt_name}")
+
+    with connect_report(
+        report=target_rpt_name,
+        workspace=workspace
+    ) as rpt:
+
+        report_json = rpt.get("report.json")
+
+        sections = report_json.get("sections", [])
+
+        print("Number of sections:", len(sections))
+
+        measure_count = 0
+
+        def scan(obj, path="root"):
+
+            nonlocal measure_count
+
+            if isinstance(obj, dict):
+
+                for key, value in obj.items():
+
+                    current_path = f"{path}.{key}"
+
+                    if key in ["query", "config", "filters"]:
+                        text = str(value)
+
+                        if "Measure" in text or "measure" in text:
+                            measure_count += 1
+
+                            print("\n==============================")
+                            print("MEASURE REFERENCE FOUND")
+                            print("==============================")
+                            print("Path:", current_path)
+                            print("Text:")
+                            print(text[:2000])
+
+                    scan(value, current_path)
+
+            elif isinstance(obj, list):
+
+                for i, item in enumerate(obj):
+                    scan(item, f"{path}[{i}]")
+
+        scan(sections, "sections")
+
+        print("\n==============================")
+        print("TOTAL VISUAL/QUERY MEASURE HITS:", measure_count)
+        print("==============================")
+
+
+inspect_legacy_visual_queries(
+    "Coms DB Landing Page (2)_clone_report",
+    target_workspace
+)
