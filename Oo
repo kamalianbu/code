@@ -1,0 +1,45 @@
+import json
+
+with connect_report(
+    report="Coms DB Landing Page (2)_clone_report",
+    workspace=target_workspace
+) as rpt:
+
+    report_json = rpt.get("report.json")
+
+    print("Searching visual config JSON for measure objects...")
+    print("=" * 60)
+
+    found = 0
+
+    for s_idx, section in enumerate(report_json.get("sections", [])):
+
+        for v_idx, visual in enumerate(section.get("visualContainers", [])):
+
+            config = visual.get("config")
+
+            if isinstance(config, str):
+                try:
+                    config_obj = json.loads(config)
+                except Exception:
+                    continue
+            else:
+                config_obj = config
+
+            text = json.dumps(config_obj)
+
+            if '"Measure"' in text or '"measure"' in text:
+
+                print("\nMEASURE REFERENCE FOUND")
+                print("Section:", s_idx)
+                print("Visual :", v_idx)
+
+                # Print only the relevant part
+                for key in ["singleVisual", "prototypeQuery"]:
+                    if key in config_obj:
+                        print(key, "=", str(config_obj[key])[:3000])
+
+                found += 1
+
+    print("\n" + "=" * 60)
+    print("TOTAL VISUALS WITH MEASURE REFERENCES:", found)
