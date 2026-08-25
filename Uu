@@ -1,0 +1,105 @@
+def get_legacy_report_measures(target_rpt_name, workspace):
+    print(f"\nreading legacy report extensions for: {target_rpt_name}")
+
+    rows = []
+
+    try:
+        with connect_report(
+            report=target_rpt_name,
+            workspace=workspace
+        ) as legacy_rpt:
+
+            extensions = None
+
+            # PBIR-Legacy report-level measures are stored here
+            try:
+                extensions = legacy_rpt.get(
+                    "definition/reportExtensions.json",
+                    verbose=False
+                )
+            except Exception as e:
+                print(
+                    f"{target_rpt_name}: could not read reportExtensions.json - "
+                    f"{str(e)[:300]}"
+                )
+
+            print("reportExtensions.json type:", type(extensions))
+
+            if extensions is None:
+                print(
+                    f"{target_rpt_name}: "
+                    "Could not read PBIR-Legacy reportExtensions.json."
+                )
+                return pd.DataFrame()
+
+            if isinstance(extensions, str):
+                try:
+                    extensions = json.loads(extensions)
+                except Exception as e:
+                    print(
+                        f"{target_rpt_name}: "
+                        f"Could not parse reportExtensions.json: {e}"
+                    )
+                    return pd.DataFrame()
+
+            if not isinstance(extensions, dict):
+                print(
+                    f"{target_rpt_name}: unexpected reportExtensions.json type: "
+                    f"{type(extensions)}"
+                )
+                return pd.DataFrame()
+
+            print(
+                "reportExtensions top level keys:",
+                list(extensions.keys())
+            )
+
+            entities = extensions.get("entities", [])
+
+            if not isinstance(entities, list):
+                print(
+                    f"{target_rpt_name}: "
+                    f"'entities' is not a list. Type: {type(entities)}"
+                )
+                return pd.DataFrame()
+
+            print(
+                f"{target_rpt_name}: "
+                f"legacy measure entities found = {len(entities)}"
+            )
+
+            for entity in entities:
+                if not isinstance(entity, dict):
+                    continue
+
+                table_name = entity.get("name")
+                measures = entity.get("measures", [])
+
+                if not isinstance(measures, list):
+                    continue
+
+                for measure in measures:
+                    if not isinstance(measure, dict):
+                        continue
+
+                    rows.append({
+                        "Measure_Name": measure.get("name"),
+                        "Table_Name": table_name,
+                        "Expression": measure.get("expression"),
+                        "Data_type": measure.get("dataType"),
+                        "Format_String": measure.get("formatString")
+                    })
+
+            print(
+                f"{target_rpt_name}: "
+                f"{len(rows)} legacy report-level measures found."
+            )
+
+            return pd.DataFrame(rows)
+
+    except Exception as e:
+        print(
+            f"{target_rpt_name}: "
+            f"PBIR-Legacy read error - {str(e)[:300]}"
+        )
+        return pd.DataFrame()
