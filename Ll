@@ -1,0 +1,245 @@
+def get_legacy_report_measures(target_rpt_name, workspace):
+    """
+    Read measure references from PBIR-Legacy report.json.
+
+    PBIR-Legacy stores visual definitions inside:
+    sections -> visualContainers -> config
+
+    The config value itself is usually a JSON string.
+    """
+
+    print(f"\nReading PBIR-Legacy definition for: {target_rpt_name}")
+
+    rows = []
+
+    try:
+        with connect_report(
+            report=target_rpt_name,
+            workspace=workspace
+        ) as legacy_rpt:
+
+            # ---------------------------------------------------------
+            # Read report.json
+            # ---------------------------------------------------------
+            report_json = None
+
+            try:
+                report_json = legacy_rpt.get(
+                    "report.json",
+                    verbose=False
+                )
+            except Exception:
+                report_json = None
+
+            if report_json is None:
+                try:
+                    report_json = legacy_rpt.get(
+                        "definition/report.json",
+                        verbose=False
+                    )
+                except Exception:
+                    report_json = None
+
+            if report_json is None:
+                print(
+                    f"{target_rpt_name}: Could not read PBIR-Legacy "
+                    "report.json"
+                )
+                return pd.DataFrame()
+
+            # ---------------------------------------------------------
+            # Convert string JSON to dictionary if required
+            # ---------------------------------------------------------
+            if isinstance(report_json, str):
+                try:
+                    report_json = json.loads(report_json)
+                except Exception as e:
+                    print(
+                        f"{target_rpt_name}: Could not parse report.json: "
+                        f"{str(e)[:300]}"
+                    )
+                    return pd.DataFrame()
+
+            if not isinstance(report_json, dict):
+                print(
+                    f"{target_rpt_name}: report.json is not a dictionary"
+                )
+                return pd.DataFrame()
+
+            # ---------------------------------------------------------
+            # Get sections
+            # ---------------------------------------------------------
+            sections = report_json.get("sections", [])
+
+            print(
+                f"{target_rpt_name}: "
+                f"Number of sections = {len(sections)}"
+            )
+
+            # ---------------------------------------------------------
+            # Scan every section
+            # ---------------------------------------------------------
+            for section_index, section in enumerate(sections):
+
+                if not isinstance(section, dict):
+                    continue
+
+                visual_containers = section.get(
+                    "visualContainers",
+                    []
+                )
+
+                # -----------------------------------------------------
+                # Scan every visual
+                # -----------------------------------------------------
+                for visual_index, visual in enumerate(
+                    visual_containers
+                ):
+
+                    if not isinstance(visual, dict):
+                        continue
+
+                    config = visual.get("config")
+
+                    if not config:
+                        continue
+
+                    # config is commonly a JSON string
+                    if isinstance(config, str):
+                        try:
+                            config_obj = json.loads(config)
+                        except Exception:
+                            continue
+                    elif isinstance(config, dict):
+                        config_obj = config
+                    else:
+                        continue
+
+                    # -------------------------------------------------
+                    # Get singleVisual
+                    # -------------------------------------------------
+                    single_visual = config_obj.get(
+                        "singleVisual",
+                        {}
+                    )
+
+                    if not isinstance(single_visual, dict):
+                        continue
+
+                    # -------------------------------------------------
+                    # Get prototypeQuery
+                    # -------------------------------------------------
+                    prototype_query = single_visual.get(
+                        "prototypeQuery",
+                        {}
+                    )
+
+                    if not isinstance(prototype_query, dict):
+                        continue
+
+                    # -------------------------------------------------
+                    # Get Select
+                    # -------------------------------------------------
+                    select_items = prototype_query.get(
+                        "Select",
+                        []
+                    )
+
+                    if not isinstance(select_items, list):
+                        continue
+
+                    # -------------------------------------------------
+                    # Find Measure references
+                    # -------------------------------------------------
+                    for select_item in select_items:
+
+                        if not isinstance(select_item, dict):
+                            continue
+
+                        measure = select_item.get("Measure")
+
+                        if not isinstance(measure, dict):
+                            continue
+
+                        expression = measure.get(
+                            "Expression",
+                            {}
+                        )
+
+                        property_name = measure.get(
+                            "Property"
+                        )
+
+                        name = measure.get(
+                            "Name"
+                        )
+
+                        native_reference_name = measure.get(
+                            "NativeReferenceName"
+                        )
+
+                        source_ref = None
+
+                        if isinstance(expression, dict):
+                            source_ref_obj = expression.get(
+                                "SourceRef",
+                                {}
+                            )
+
+                            if isinstance(
+                                source_ref_obj,
+                                dict
+                            ):
+                                source_ref = source_ref_obj.get(
+                                    "Source"
+                                )
+
+                        rows.append({
+                            "Report_Name": target_rpt_name,
+                            "Section_Index": section_index,
+                            "Visual_Index": visual_index,
+                            "Measure_Name": name,
+                            "Property": property_name,
+                            "NativeReferenceName":
+                                native_reference_name,
+                            "Source": source_ref
+                        })
+
+            # ---------------------------------------------------------
+            # Remove duplicate references
+            # ---------------------------------------------------------
+            if rows:
+
+                df = pd.DataFrame(rows)
+
+                df = df.drop_duplicates(
+                    subset=[
+                        "Report_Name",
+                        "Measure_Name",
+                        "Property",
+                        "NativeReferenceName"
+                    ]
+                ).reset_index(drop=True)
+
+                print(
+                    f"{target_rpt_name}: "
+                    f"{len(df)} measure references found in visuals."
+                )
+
+                return df
+
+            print(
+                f"{target_rpt_name}: "
+                "No measure references found in visualContainers."
+            )
+
+            return pd.DataFrame()
+
+    except Exception as e:
+
+        print(
+            f"{target_rpt_name}: "
+            f"PBIR-Legacy read error - {str(e)[:500]}"
+        )
+
+        return pd.DataFrame()
