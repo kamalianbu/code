@@ -1,0 +1,60 @@
+def remove_report_level_measures(reports: list, workspace: str, report_suffix: str = "") -> pd.DataFrame:
+    summary = []
+
+    for rpt_name in reports:
+        target_rpt_name = f"{rpt_name}{report_suffix}"
+
+        # Detect format the same way catalog_report_level_measures does
+        try:
+            _ = ReportWrapper(report=target_rpt_name, workspace=workspace)
+            is_legacy = False
+        except NotImplementedError:
+            is_legacy = True
+
+        if is_legacy:
+            df = get_legacy_report_measures(target_rpt_name, workspace)
+            if df.empty:
+                print(f"  {target_rpt_name}: no legacy embedded measures, skipping")
+                summary.append({"Report": target_rpt_name, "Format": "PBIR-Legacy",
+                                 "Measures Removed": 0, "Status": "Already clean"})
+                continue
+
+            with connect_report(report=target_rpt_name, workspace=workspace, readonly=False) as legacy_rpt:
+                report_json = legacy_rpt.get("report.json", verbose=False) or legacy_rpt.get("definition/report.json", verbose=False)
+                if isinstance(report_json, str):
+                    report_json = json.loads(report_json)
+
+                removed = 0
+
+                def strip_measures(obj):
+                    nonlocal removed
+                    if isinstance(obj, dict):
+                        entities = obj.get("entities")
+                        if isinstance(entities, list):
+                            for entity in entities:
+                                if isinstance(entity, dict) and entity.get("measures"):
+                                    removed += len(entity["measures"])
+                                    entity["measures"] = []
+                            obj["entities"] = [
+                                e for e in entities
+                                if isinstance(e, dict) and (
+                                    e.get("measures") or e.get("columns") or e.get("hierarchies")
+                                )
+                            ]
+                        for v in obj.values():
+                            strip_measures(v)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            strip_measures(item)
+
+                strip_measures(report_json)
+                legacy_rpt.set("report.json", report_json)  # match whatever save method connect_report exposes
+
+            summary.append({"Report": target_rpt_name, "Format": "PBIR-Legacy",
+                             "Measures Removed": removed, "Status": "Cleaned"})
+            print(f"  {target_rpt_name}: removed {removed} legacy embedded measure(s)")
+            continue
+
+        # --- existing PBIR (reportExtensions.json) path stays as-is below ---
+        with connect_report(report=target_rpt_name, workspace=workspace, readonly=False) as rpt:
+            ... # your current reportExtensions.json logic, unchanged
